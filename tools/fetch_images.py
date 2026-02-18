@@ -7,18 +7,12 @@ downloads bottle images, converts to WebP, and updates products.json.
 
 Features:
 - Resumable: saves progress to a checkpoint file
-- Rate-limited: 1.5-2s between requests to be respectful
+- Rate-limit aware: detects 429 pages, pauses, and retries with backoff
 - Groups products by fragrance to minimize searches
 - Skips gift sets (no standard product images)
-- Concurrent browser pages for speed (configurable)
 
 Usage:
-    python3 tools/fetch_images.py [--max N] [--reset] [--dry-run]
-
-Options:
-    --max N     Process at most N fragrances (for testing)
-    --reset     Clear checkpoint and start fresh
-    --dry-run   Show what would be searched without downloading
+    python3 tools/fetch_images.py [--max N] [--reset] [--reset-failed] [--dry-run]
 """
 
 import asyncio
@@ -27,14 +21,15 @@ import os
 import re
 import sys
 import time
+import random
 import hashlib
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List
 from collections import defaultdict
 
 try:
-    from playwright.async_api import async_playwright, Page, BrowserContext
+    from playwright.async_api import async_playwright, Page
 except ImportError:
     print("ERROR: playwright is required. Install with: pip3 install playwright")
     sys.exit(1)
@@ -49,7 +44,6 @@ except ImportError:
 try:
     import httpx
 except ImportError:
-    # Fallback to requests
     httpx = None
     import requests
 
@@ -65,33 +59,26 @@ CHECKPOINT_FILE = DATA_DIR / "image_checkpoint.json"
 MAX_IMAGE_WIDTH = 400
 MAX_IMAGE_HEIGHT = 500
 WEBP_QUALITY = 85
-DELAY_BETWEEN_SEARCHES = 1.5  # seconds
-SEARCH_TIMEOUT = 12000  # ms
-PAGE_TIMEOUT = 10000  # ms
+BASE_DELAY = 5.0          # seconds between requests
+JITTER = 2.0              # random jitter added to delay
+RATE_LIMIT_PAUSE = 300.0  # 5 minutes pause on rate limit
+SEARCH_TIMEOUT = 15000    # ms
 
 
 def clean_search_query(raw_name: str) -> str:
     """Extract a clean fragrance name for searching Fragrantica."""
     q = raw_name
-    # Remove size (e.g., "3.4 oz")
     q = re.sub(r'\d+\.?\d*\s*oz\.?', '', q)
-    # Remove common fragrance types
     for t in ['EDP', 'EDT', 'EDC', 'Parfum', 'Cologne', 'Body Mist', 'Body Spray',
               'Eau De Parfum', 'Eau De Toilette']:
         q = re.sub(r'\b' + re.escape(t) + r'\b', '', q, flags=re.IGNORECASE)
-    # Remove gender markers
     q = re.sub(r'\bfor\s+(men|women|woman|unisex)\b', '', q, flags=re.IGNORECASE)
-    # Remove TESTER, Gift Set, Refillable
     q = re.sub(r'\bTESTER\b', '', q, flags=re.IGNORECASE)
     q = re.sub(r'\bGift\s+Set\b', '', q, flags=re.IGNORECASE)
     q = re.sub(r'\bRe\s*f+il+able\b', '', q, flags=re.IGNORECASE)
-    # Remove piece counts (e.g., "2 Piece", "3 PC")
     q = re.sub(r'\b\d+\s*(Piece|PC|Pcs?)\b', '', q, flags=re.IGNORECASE)
-    # Remove UPC artifacts (long numbers)
     q = re.sub(r'\b[a-z]?\d{10,}\b', '', q)
-    # Remove trailing price artifacts (e.g., "102.0")
     q = re.sub(r'\b\d+\.\d+$', '', q)
-    # Clean up whitespace and punctuation
     q = re.sub(r'\s+', ' ', q).strip().strip('.')
     return q
 
@@ -101,10 +88,10 @@ def group_products(products: List[dict]) -> Dict[str, List[dict]]:
     groups = defaultdict(list)
     for p in products:
         if p.get('is_gift_set'):
-            continue  # Skip gift sets
+            continue
         query = clean_search_query(p['raw_name'])
         if len(query) < 3:
-            continue  # Skip too-short queries
+            continue
         groups[query].append(p)
     return dict(groups)
 
@@ -112,58 +99,105 @@ def group_products(products: List[dict]) -> Dict[str, List[dict]]:
 def make_image_filename(query: str) -> str:
     """Generate a stable filename from search query."""
     slug = re.sub(r'[^a-z0-9]+', '-', query.lower()).strip('-')
-    # Add hash for uniqueness if slug is too generic
     h = hashlib.md5(query.encode()).hexdigest()[:6]
     return f"{slug[:80]}-{h}.webp"
 
 
-async def search_fragrantica(page: Page, query: str) -> Optional[str]:
-    """Search Fragrantica and return the first product page URL."""
-    search_url = f"https://www.fragrantica.com/search/?query={query.replace(' ', '+')}"
+async def is_rate_limited(page: Page) -> bool:
+    """Check if current page shows a rate limit / anti-bot response."""
+    try:
+        content = await page.content()
+        lower = content.lower()
+        return any(s in lower for s in ['too many requests', 'giphy.com', 'access denied',
+                                         'captcha', 'rate limit'])
+    except Exception:
+        return False
+
+
+async def wait_for_rate_limit_clear(page: Page, context_factory):
+    """Wait until Fragrantica is accessible again, checking every 5 minutes."""
+    print("\n>>> Rate limited. Waiting for it to clear (checking every 5 min)...")
+    attempt = 0
+    while True:
+        attempt += 1
+        await asyncio.sleep(RATE_LIMIT_PAUSE)
+        print(f"    Checking if rate limit cleared (attempt {attempt})...")
+        try:
+            # Test with a simple search
+            await page.goto('https://www.fragrantica.com/search/?query=chanel',
+                          wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
+            await page.wait_for_timeout(2000)
+            if not await is_rate_limited(page):
+                print("    >>> Rate limit cleared! Resuming...\n")
+                return
+            else:
+                print(f"    Still rate limited. Waiting another 5 min...")
+        except Exception:
+            print(f"    Connection error. Waiting another 5 min...")
+
+
+async def search_and_get_image(page: Page, query: str) -> Optional[dict]:
+    """
+    Search Fragrantica and extract the product page URL and image.
+    Returns dict with 'image_url' and 'fragrantica_url', or None, or "RATE_LIMITED".
+    """
+    encoded = query.replace(' ', '+')
+    search_url = f"https://www.fragrantica.com/search/?query={encoded}"
 
     try:
         await page.goto(search_url, wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
-        await page.wait_for_timeout(1500)
+        await page.wait_for_timeout(2000)
 
-        # Find product links in search results
-        links = await page.query_selector_all('a[href*="/perfume/"]')
+        if await is_rate_limited(page):
+            return "RATE_LIMITED"
 
-        for link in links[:5]:  # Check first 5 results
-            href = await link.get_attribute('href')
+        # Find product links
+        results = await page.query_selector_all('a[href*="/perfume/"]')
+
+        best_url = None
+        for result in results[:5]:
+            href = await result.get_attribute('href')
             if href and '/perfume/' in href and href.endswith('.html'):
-                # Ensure it's a full URL
                 if href.startswith('/'):
                     href = 'https://www.fragrantica.com' + href
-                return href
+                best_url = href
+                break
 
-    except Exception as e:
-        pass  # Will return None
+        if not best_url:
+            return None
 
-    return None
+        # Extract Fragrantica product ID from URL to construct image URL directly
+        # URL format: /perfume/Brand/Product-Name-12345.html → ID is 12345
+        id_match = re.search(r'-(\d+)\.html$', best_url)
+        if id_match:
+            frag_id = id_match.group(1)
+            image_url = f"https://fimgs.net/mdimg/perfume-thumbs/375x500.{frag_id}.jpg"
+            return {"image_url": image_url, "fragrantica_url": best_url}
 
+        # Fallback: visit the product page to get the image
+        await asyncio.sleep(1.5)
+        try:
+            await page.goto(best_url, wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
+            await page.wait_for_timeout(1500)
 
-async def get_product_image_url(page: Page, product_url: str) -> Optional[str]:
-    """Visit a Fragrantica product page and extract the main bottle image URL."""
-    try:
-        await page.goto(product_url, wait_until='domcontentloaded', timeout=PAGE_TIMEOUT)
-        await page.wait_for_timeout(800)
+            if await is_rate_limited(page):
+                return "RATE_LIMITED"
 
-        # Primary: itemprop="image" (most reliable)
-        img = await page.query_selector('img[itemprop="image"]')
-        if img:
-            src = await img.get_attribute('src')
-            if src and 'perfume-thumbs' in src:
-                # Upgrade to larger size if possible
-                src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
-                return src
+            img = await page.query_selector('img[itemprop="image"]')
+            if img:
+                src = await img.get_attribute('src')
+                if src and 'perfume-thumbs' in src:
+                    src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
+                    return {"image_url": src, "fragrantica_url": best_url}
 
-        # Fallback: look for perfume-thumbs image
-        imgs = await page.query_selector_all('img[src*="perfume-thumbs"]')
-        for img in imgs:
-            src = await img.get_attribute('src')
-            if src:
-                src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
-                return src
+            imgs = await page.query_selector_all('img[src*="perfume-thumbs"]')
+            for img in imgs:
+                src = await img.get_attribute('src')
+                if src:
+                    src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
+                    return {"image_url": src, "fragrantica_url": best_url}
+        except Exception:
+            pass
 
     except Exception:
         pass
@@ -172,25 +206,23 @@ async def get_product_image_url(page: Page, product_url: str) -> Optional[str]:
 
 
 async def download_image(url: str) -> Optional[bytes]:
-    """Download an image and return its bytes."""
+    """Download an image from the CDN."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
         'Referer': 'https://www.fragrantica.com/',
     }
-
     try:
         if httpx:
             async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
                 resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
+                if resp.status_code == 200 and len(resp.content) > 500:
                     return resp.content
         else:
             resp = requests.get(url, headers=headers, timeout=15)
-            if resp.status_code == 200:
+            if resp.status_code == 200 and len(resp.content) > 500:
                 return resp.content
     except Exception:
         pass
-
     return None
 
 
@@ -198,89 +230,87 @@ def process_image(image_data: bytes, output_path: Path) -> bool:
     """Resize image and save as WebP."""
     try:
         img = Image.open(io.BytesIO(image_data))
-
-        # Convert to RGB if necessary (e.g., RGBA or palette mode)
         if img.mode in ('RGBA', 'P', 'LA'):
-            background = Image.new('RGB', img.size, (10, 10, 10))  # Dark background
+            bg = Image.new('RGB', img.size, (10, 10, 10))
             if img.mode == 'P':
                 img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if 'A' in img.mode else None)
-            img = background
+            bg.paste(img, mask=img.split()[-1] if 'A' in img.mode else None)
+            img = bg
         elif img.mode != 'RGB':
             img = img.convert('RGB')
-
-        # Resize maintaining aspect ratio
         img.thumbnail((MAX_IMAGE_WIDTH, MAX_IMAGE_HEIGHT), Image.LANCZOS)
-
-        # Save as WebP
         img.save(str(output_path), 'WEBP', quality=WEBP_QUALITY)
         return True
-
     except Exception as e:
         print(f"    [!] Image processing error: {e}")
         return False
 
 
 def load_checkpoint() -> dict:
-    """Load progress checkpoint."""
     if CHECKPOINT_FILE.exists():
         with open(CHECKPOINT_FILE) as f:
             return json.load(f)
-    return {"completed": {}, "failed": [], "stats": {"searched": 0, "found": 0, "downloaded": 0}}
+    return {"completed": {}, "failed": [], "stats": {"searched": 0, "downloaded": 0}}
 
 
 def save_checkpoint(checkpoint: dict):
-    """Save progress checkpoint."""
     with open(CHECKPOINT_FILE, 'w') as f:
         json.dump(checkpoint, f, indent=2)
 
 
-async def run_pipeline(max_items: Optional[int] = None, dry_run: bool = False):
-    """Main pipeline: search Fragrantica, download images, update products.json."""
+def update_products_json(products: list, completed: dict):
+    """Update products.json with image paths from completed downloads."""
+    for p in products:
+        query = clean_search_query(p['raw_name'])
+        if query in completed:
+            p['image_url'] = completed[query]['image_file']
+            p['has_image'] = True
 
-    # Load products
+    with open(PRODUCTS_FILE, 'w') as f:
+        json.dump(products, f, indent=2)
+
+    total = sum(1 for p in products if p.get('has_image'))
+    print(f"    products.json updated: {total}/{len(products)} have images ({total/len(products)*100:.1f}%)")
+
+
+async def run_pipeline(max_items: Optional[int] = None, dry_run: bool = False):
     with open(PRODUCTS_FILE) as f:
         products = json.load(f)
 
     print(f"Loaded {len(products)} products")
 
-    # Group by fragrance
     groups = group_products(products)
-    print(f"Grouped into {len(groups)} unique fragrances (excluding gift sets)")
+    print(f"{len(groups)} unique fragrances (excluding gift sets)")
 
-    # Load checkpoint
     checkpoint = load_checkpoint()
-    completed = checkpoint["completed"]  # query -> {image_file, fragrantica_url}
+    completed = checkpoint["completed"]
     stats = checkpoint["stats"]
+    failed_set = set(checkpoint.get("failed", []))
 
-    # Filter to uncompleted
-    todo = {q: prods for q, prods in groups.items() if q not in completed and q not in checkpoint.get("failed", [])}
-    print(f"Already completed: {len(completed)}")
-    print(f"Remaining: {len(todo)}")
+    todo = {q: prods for q, prods in groups.items()
+            if q not in completed and q not in failed_set}
 
+    print(f"Completed: {len(completed)} | Failed: {len(failed_set)} | Remaining: {len(todo)}")
+
+    todo_items = list(todo.items())
     if max_items:
-        todo_items = list(todo.items())[:max_items]
-    else:
-        todo_items = list(todo.items())
+        todo_items = todo_items[:max_items]
 
     if dry_run:
-        print("\n[DRY RUN] Would search for:")
+        print(f"\n[DRY RUN] Would search for {len(todo_items)} fragrances")
         for q, prods in todo_items[:20]:
             print(f"  \"{q}\" ({len(prods)} products)")
-        if len(todo_items) > 20:
-            print(f"  ... and {len(todo_items) - 20} more")
         return
 
     if not todo_items:
-        print("Nothing to do! All fragrances have been processed.")
-        print("Updating products.json with image paths...")
+        print("Nothing new to process.")
         update_products_json(products, completed)
         return
 
-    print(f"\nStarting image pipeline for {len(todo_items)} fragrances...")
-    print(f"Estimated time: ~{len(todo_items) * 3 / 60:.0f} minutes\n")
+    est_hours = len(todo_items) * (BASE_DELAY + JITTER/2) / 3600
+    print(f"\nProcessing {len(todo_items)} fragrances (~{est_hours:.1f} hours at {BASE_DELAY}s delay)")
+    print(f"Start time: {time.strftime('%H:%M:%S')}\n")
 
-    # Ensure images directory exists
     IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 
     async with async_playwright() as p:
@@ -291,118 +321,111 @@ async def run_pipeline(max_items: Optional[int] = None, dry_run: bool = False):
         )
         page = await context.new_page()
 
-        found_count = 0
-        fail_count = 0
+        # First: wait until rate limit clears
+        print("Checking if Fragrantica is accessible...")
+        await page.goto('https://www.fragrantica.com/search/?query=chanel',
+                       wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
+        await page.wait_for_timeout(2000)
+        if await is_rate_limited(page):
+            await wait_for_rate_limit_clear(page, None)
+
+        found = 0
+        missed = 0
         start_time = time.time()
 
         for i, (query, prods) in enumerate(todo_items):
             elapsed = time.time() - start_time
-            rate = (i + 1) / max(elapsed, 1) * 3600
-            remaining = (len(todo_items) - i) / max(rate / 3600, 0.001)
+            rate_per_sec = max((i + 1) / max(elapsed, 1), 0.001)
+            remaining_min = (len(todo_items) - i) / rate_per_sec / 60
 
-            print(f"[{i+1}/{len(todo_items)}] Searching: \"{query}\" ({len(prods)} products) "
-                  f"[{found_count} found, {fail_count} missed, ~{remaining:.0f}min left]")
+            print(f"[{i+1}/{len(todo_items)}] \"{query}\" ({len(prods)} prods) "
+                  f"[{found} ok, {missed} miss, ~{remaining_min:.0f}m]")
 
-            # Search for the product page
-            product_url = await search_fragrantica(page, query)
-            stats["searched"] += 1
+            result = await search_and_get_image(page, query)
 
-            if not product_url:
-                print(f"    [-] No results found")
+            # Handle rate limiting with wait-and-retry
+            if result == "RATE_LIMITED":
+                await wait_for_rate_limit_clear(page, None)
+                # Retry this query
+                result = await search_and_get_image(page, query)
+                if result == "RATE_LIMITED":
+                    print("    Still limited after wait. Skipping for now.")
+                    await asyncio.sleep(BASE_DELAY)
+                    continue
+
+            stats["searched"] = stats.get("searched", 0) + 1
+
+            if result is None:
+                missed += 1
                 checkpoint.setdefault("failed", []).append(query)
-                fail_count += 1
-                await asyncio.sleep(DELAY_BETWEEN_SEARCHES)
+                await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
                 continue
 
-            # Get the image URL from the product page
-            image_url = await get_product_image_url(page, product_url)
-            stats["found"] += 1
-
-            if not image_url:
-                print(f"    [-] No image on page: {product_url}")
-                checkpoint.setdefault("failed", []).append(query)
-                fail_count += 1
-                await asyncio.sleep(DELAY_BETWEEN_SEARCHES)
-                continue
-
-            # Download the image
-            image_data = await download_image(image_url)
+            # Download image from CDN (not rate-limited)
+            image_data = await download_image(result["image_url"])
 
             if not image_data:
-                print(f"    [-] Download failed: {image_url}")
+                missed += 1
                 checkpoint.setdefault("failed", []).append(query)
-                fail_count += 1
-                await asyncio.sleep(DELAY_BETWEEN_SEARCHES)
+                await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
                 continue
 
-            # Process and save
             filename = make_image_filename(query)
             output_path = IMAGES_DIR / filename
 
             if process_image(image_data, output_path):
-                file_size = output_path.stat().st_size / 1024
-                print(f"    [+] Saved: {filename} ({file_size:.1f} KB)")
+                kb = output_path.stat().st_size / 1024
+                print(f"    [+] {filename} ({kb:.1f}KB)")
                 completed[query] = {
                     "image_file": f"/images/products/{filename}",
-                    "fragrantica_url": product_url,
+                    "fragrantica_url": result["fragrantica_url"],
                 }
-                found_count += 1
-                stats["downloaded"] += 1
+                found += 1
+                stats["downloaded"] = stats.get("downloaded", 0) + 1
             else:
+                missed += 1
                 checkpoint.setdefault("failed", []).append(query)
-                fail_count += 1
 
-            # Save checkpoint every 10 items
+            # Save checkpoint every 10, update products.json every 100
             if (i + 1) % 10 == 0:
                 save_checkpoint(checkpoint)
+            if (i + 1) % 100 == 0:
+                update_products_json(products, completed)
 
-            # Rate limit
-            await asyncio.sleep(DELAY_BETWEEN_SEARCHES)
+            await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
 
         await browser.close()
 
-    # Final checkpoint save
     save_checkpoint(checkpoint)
 
-    # Update products.json
+    total_elapsed = (time.time() - start_time) / 60
     print(f"\n{'='*60}")
-    print(f"Pipeline complete!")
-    print(f"  Searched: {stats['searched']}")
-    print(f"  Found:    {stats['found']}")
-    print(f"  Downloaded: {stats['downloaded']}")
-    print(f"  Coverage: {stats['downloaded']}/{len(groups)} ({stats['downloaded']/max(len(groups),1)*100:.1f}%)")
+    print(f"Pipeline complete! ({total_elapsed:.0f} minutes)")
+    print(f"  Downloaded: {found}")
+    print(f"  Missed: {missed}")
+    print(f"  Total coverage: {len(completed)}/{len(groups)} ({len(completed)/max(len(groups),1)*100:.1f}%)")
     print(f"{'='*60}")
 
     update_products_json(products, completed)
-
-
-def update_products_json(products: list, completed: dict):
-    """Update products.json with image paths from completed downloads."""
-    updated = 0
-    for p in products:
-        query = clean_search_query(p['raw_name'])
-        if query in completed:
-            info = completed[query]
-            p['image_url'] = info['image_file']
-            p['has_image'] = True
-            updated += 1
-
-    with open(PRODUCTS_FILE, 'w') as f:
-        json.dump(products, f, indent=2)
-
-    total_with_images = sum(1 for p in products if p.get('has_image'))
-    print(f"\nUpdated products.json: {total_with_images}/{len(products)} products now have images ({total_with_images/len(products)*100:.1f}%)")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch fragrance images from Fragrantica")
     parser.add_argument("--max", type=int, default=None, help="Max fragrances to process")
     parser.add_argument("--reset", action="store_true", help="Clear checkpoint and start fresh")
+    parser.add_argument("--reset-failed", action="store_true", help="Clear failed list only (retry)")
     parser.add_argument("--dry-run", action="store_true", help="Show queries without downloading")
     args = parser.parse_args()
 
     if args.reset and CHECKPOINT_FILE.exists():
         os.remove(CHECKPOINT_FILE)
         print("Checkpoint cleared.")
+    elif args.reset_failed and CHECKPOINT_FILE.exists():
+        with open(CHECKPOINT_FILE) as f:
+            cp = json.load(f)
+        cp["failed"] = []
+        with open(CHECKPOINT_FILE, 'w') as f:
+            json.dump(cp, f, indent=2)
+        print("Failed list cleared.")
 
     asyncio.run(run_pipeline(max_items=args.max, dry_run=args.dry_run))
