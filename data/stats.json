@@ -1,0 +1,50 @@
+{
+  "total_products": 4865,
+  "by_gender": {
+    "men": 1824,
+    "unisex": 1030,
+    "women": 2011
+  },
+  "by_type": {
+    "EDP": 2599,
+    "EDT": 1597,
+    "Parfum": 147,
+    "Cologne": 25,
+    "Le Parfum": 24,
+    "EDC": 20,
+    "Parfum Intense": 10,
+    "Body Mist": 10,
+    "Body Spray": 3
+  },
+  "by_size": {
+    "3.4 oz": 2471,
+    "3.3 oz": 428,
+    "2.5 oz": 309,
+    "1.7 oz": 209,
+    "2.7 oz": 190,
+    "3 oz": 187,
+    "4.2 oz": 171,
+    "6.7 oz": 97,
+    "1 oz": 58,
+    "2.8 oz": 55,
+    "4 oz": 52,
+    "2 oz": 50,
+    "5 oz": 50,
+    "1.17 oz": 38,
+    "6.8 oz": 36,
+    "5.1 oz": 27,
+    "1.6 oz": 20,
+    "3.04 oz": 19,
+    "3.6 oz": 16,
+    "8 oz": 9
+  },
+  "price_range": {
+    "min": 3.25,
+    "max": 825.0,
+    "avg": 119.09
+  },
+  "missing_prices": 167,
+  "gift_sets": 34,
+  "testers": 18,
+  "with_images": 0
+}
