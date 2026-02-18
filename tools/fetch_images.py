@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Fragrantica Image Pipeline
-==========================
-Searches Fragrantica for product images using Playwright (headless browser),
-downloads bottle images, converts to WebP, and updates products.json.
+Fragrantica Image Pipeline v2
+==============================
+Instead of searching for each product individually (triggers rate limits),
+this script scrapes Fragrantica BRAND PAGES to build a local lookup table,
+then matches products using fuzzy string matching and downloads images
+directly from the CDN (which is not rate-limited).
 
-Features:
-- Resumable: saves progress to a checkpoint file
-- Rate-limit aware: detects 429 pages, pauses, and retries with backoff
-- Groups products by fragrance to minimize searches
-- Skips gift sets (no standard product images)
+Phase 1: Scrape ~250 brand pages → local catalog of {name → image_id}
+Phase 2: Fuzzy-match our products against the catalog
+Phase 3: Download images from fimgs.net CDN
 
 Usage:
-    python3 tools/fetch_images.py [--max N] [--reset] [--reset-failed] [--dry-run]
+    python3 tools/fetch_images.py [--max-brands N] [--reset] [--dry-run]
 """
 
 import asyncio
@@ -25,13 +25,16 @@ import random
 import hashlib
 import argparse
 from pathlib import Path
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Tuple
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 try:
     from playwright.async_api import async_playwright, Page
+    from playwright_stealth import stealth_async
 except ImportError:
-    print("ERROR: playwright is required. Install with: pip3 install playwright")
+    print("ERROR: playwright and playwright-stealth are required.")
+    print("  pip3 install playwright tf-playwright-stealth")
     sys.exit(1)
 
 try:
@@ -53,24 +56,245 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 IMAGES_DIR = BASE_DIR / "public" / "images" / "products"
 PRODUCTS_FILE = DATA_DIR / "products.json"
+CATALOG_FILE = DATA_DIR / "fragrantica_catalog.json"  # scraped brand data
 CHECKPOINT_FILE = DATA_DIR / "image_checkpoint.json"
 
 # Config
 MAX_IMAGE_WIDTH = 400
 MAX_IMAGE_HEIGHT = 500
 WEBP_QUALITY = 85
-BASE_DELAY = 5.0          # seconds between requests
-JITTER = 2.0              # random jitter added to delay
-RATE_LIMIT_PAUSE = 300.0  # 5 minutes pause on rate limit
-SEARCH_TIMEOUT = 15000    # ms
+BRAND_PAGE_DELAY = 4.0  # seconds between brand page requests
+FUZZY_THRESHOLD = 0.55  # minimum similarity score for matching
+
+
+# ─── Brand name mapping: our brands → Fragrantica URL slugs ───
+# Many "brands" in our data are actually product lines (e.g., "Boss" = Hugo Boss,
+# "Good Girl" = Carolina Herrera). This map normalizes them.
+BRAND_URL_MAP = {
+    # Actual brands
+    "Abercrombie": "Abercrombie---Fitch", "Abercrombie & Fitch": "Abercrombie---Fitch",
+    "Acqua di Parma": "Acqua-di-Parma",
+    "Adidas": "Adidas", "Afnan": "Afnan", "Ajmal": "Ajmal",
+    "Al Haramain": "Al-Haramain-Perfumes",
+    "Amouage": "Amouage", "Animale": "Animale",
+    "Antonio Banderas": "Antonio-Banderas",
+    "Aramis": "Aramis", "Armaf": "Armaf", "Azzaro": "Azzaro",
+    "Balmain": "Balmain", "Bebe": "Bebe",
+    "Benetton": "Benetton", "Bentley": "Bentley",
+    "Bond No.9": "Bond-No-9", "Bond No. 9": "Bond-No-9",
+    "Boucheron": "Boucheron",
+    "Britney Spears": "Britney-Spears",
+    "Bulgari": "Bvlgari", "Bvlgari": "Bvlgari",
+    "Burberry": "Burberry",
+    "Calvin Klein": "Calvin-Klein",
+    "Carolina Herrera": "Carolina-Herrera",
+    "Cartier": "Cartier", "Chanel": "Chanel",
+    "Chloe": "Chloe",
+    "Clive Christian": "Clive-Christian",
+    "Coach": "Coach", "Creed": "Creed",
+    "Cuba": "Cuba-Paris",
+    "D&G": "Dolce-Gabbana", "Dior": "Dior",
+    "Diesel": "Diesel", "Diptyque": "Diptyque",
+    "DKNY": "DKNY",
+    "Dolce & Gabbana": "Dolce-Gabbana",
+    "Donna Karan": "Donna-Karan",
+    "Ed Hardy": "Ed-Hardy",
+    "Elizabeth Arden": "Elizabeth-Arden",
+    "Elizabeth Taylor": "Elizabeth-Taylor",
+    "Escada": "Escada",
+    "Estee Lauder": "Estee-Lauder",
+    "Ferragamo": "Salvatore-Ferragamo", "Salvatore Ferragamo": "Salvatore-Ferragamo",
+    "Ferrari": "Ferrari",
+    "Fugazzi": "Fugazzi",
+    "Givenchy": "Givenchy",
+    "Gucci": "Gucci", "Guess": "Guess", "Guerlain": "Guerlain",
+    "Halston": "Halston",
+    "Hugo Boss": "Hugo-Boss",
+    "Initio": "Initio-Parfums-Prives",
+    "Issey Miyake": "Issey-Miyake",
+    "Jaguar": "Jaguar",
+    "Jean Paul Gaultier": "Jean-Paul-Gaultier",
+    "Jimmy Choo": "Jimmy-Choo",
+    "Jo Malone": "Jo-Malone-London",
+    "John Varvatos": "John-Varvatos",
+    "Joop": "JOOP-",
+    "Juicy Couture": "Juicy-Couture",
+    "Kenneth Cole": "Kenneth-Cole",
+    "Kenzo": "Kenzo",
+    "Kilian": "By-Kilian",
+    "La Rive": "La-Rive",
+    "Lacoste": "Lacoste", "Lalique": "Lalique",
+    "Lancome": "Lancome",
+    "Lattafa": "Lattafa",
+    "Loewe": "Loewe",
+    "Lomani": "Lomani",
+    "Mancera": "Mancera",
+    "Marc Jacobs": "Marc-Jacobs",
+    "Maison Francis Kurkdjian": "Maison-Francis-Kurkdjian",
+    "Mercedes Benz": "Mercedes-Benz", "Mercedes-Benz": "Mercedes-Benz",
+    "Michael Kors": "Michael-Kors",
+    "Missoni": "Missoni",
+    "Montale": "Montale",
+    "Mont Blanc": "Montblanc", "Montblanc": "Montblanc",
+    "Moschino": "Moschino",
+    "Mugler": "Mugler",
+    "Narciso Rodriguez": "Narciso-Rodriguez",
+    "Nautica": "Nautica", "Nishane": "Nishane",
+    "Oscar de la Renta": "Oscar-de-la-Renta",
+    "Paco Rabanne": "Paco-Rabanne",
+    "Parfums de Marly": "Parfums-de-Marly",
+    "Paris Hilton": "Paris-Hilton",
+    "Penhaligons": "Penhaligon-s", "Penhaligon's": "Penhaligon-s",
+    "Penguin": "Original-Penguin",
+    "Perry Ellis": "Perry-Ellis",
+    "Prada": "Prada",
+    "Ralph Lauren": "Ralph-Lauren",
+    "Rochas": "Rochas",
+    "Roja": "Roja-Dove",
+    "Sean John": "Sean-John",
+    "Shakira": "Shakira",
+    "Swiss Army": "Victorinox-Swiss-Army",
+    "Tiziana": "Tiziana-Terenzi",
+    "Tom Ford": "Tom-Ford",
+    "Tommy Bahama": "Tommy-Bahama",
+    "Tommy Hilfiger": "Tommy-Hilfiger",
+    "Tous": "Tous",
+    "Valentino": "Valentino",
+    "Van Cleef & Arpels": "Van-Cleef-Arpels",
+    "Vera Wang": "Vera-Wang",
+    "Versace": "Versace",
+    "Viktor & Rolf": "Viktor-Rolf",
+    "Vince Camuto": "Vince-Camuto",
+    "Xerjoff": "Xerjoff",
+    "YSL": "Yves-Saint-Laurent", "Yves Saint Laurent": "Yves-Saint-Laurent",
+    "Zara": "Zara",
+    # Product-line "brands" → actual parent brand on Fragrantica
+    "1 Million": "Paco-Rabanne", "1 Million Elixir": "Paco-Rabanne",
+    "1 Million Elixir Intense": "Paco-Rabanne", "1 Million Golden Oud": "Paco-Rabanne",
+    "1 Million Gold Intense": "Paco-Rabanne", "1 Million Lucky": "Paco-Rabanne",
+    "1 Million Prive": "Paco-Rabanne",
+    "212": "Carolina-Herrera", "212 Heroes": "Carolina-Herrera", "212 VIP": "Carolina-Herrera",
+    "Acqua": "Giorgio-Armani", "Acqua Di Gio": "Giorgio-Armani",
+    "Armani": "Giorgio-Armani",
+    "Bad Boy": "Carolina-Herrera",
+    "Boss": "Hugo-Boss", "Hugo": "Hugo-Boss",
+    "Cabotine": "Gres",
+    "CH": "Carolina-Herrera",
+    "CK": "Calvin-Klein",
+    "Chrome": "Azzaro",
+    "Club de Nuit": "Armaf",
+    "Cool Water": "Davidoff",
+    "Curve": "Liz-Claiborne",
+    "Daisy": "Marc-Jacobs",
+    "Declaration": "Cartier",
+    "Dolce": "Dolce-Gabbana", "Dylan": "Versace",
+    "Eros": "Versace",
+    "Eternity": "Calvin-Klein", "Euphoria": "Calvin-Klein",
+    "Flowerbomb": "Viktor-Rolf",
+    "Good Girl": "Carolina-Herrera",
+    "Halloween": "Jesus-Del-Pozo",
+    "Her": "Burberry",
+    "Idole": "Lancome",
+    "Incanto": "Salvatore-Ferragamo",
+    "Invictus": "Paco-Rabanne",
+    "Jimmy": "Jimmy-Choo",
+    "King": "Dolce-Gabbana",
+    "La Vie Est Belle": "Lancome",
+    "Lady": "Dior", "Le Male": "Jean-Paul-Gaultier",
+    "Legend": "Montblanc",
+    "Light Blue": "Dolce-Gabbana",
+    "L'Homme": "Yves-Saint-Laurent",
+    "Miss Dior": "Dior",
+    "Narciso": "Narciso-Rodriguez",
+    "Odyssey": "Armaf",
+    "Olympea": "Paco-Rabanne",
+    "Omnia": "Bvlgari",
+    "One": "Calvin-Klein",
+    "Pasha": "Cartier",
+    "Phantom": "Paco-Rabanne",
+    "Polo": "Ralph-Lauren", "Private": "Ralph-Lauren",
+    "Replica": "Maison-Martin-Margiela",
+    "Rose": "Valentino",
+    "Sauvage": "Dior",
+    "Scandal": "Jean-Paul-Gaultier",
+    "Signorina": "Salvatore-Ferragamo",
+    "Spicebomb": "Viktor-Rolf",
+    "Supremacy": "Afnan",
+    "Sweet": "Lolita-Lempicka",
+    "The": "Dolce-Gabbana",  # "The One" etc.
+    "Tommy": "Tommy-Hilfiger",
+    "Tresor": "Lancome",
+    "Velvet": "Dolce-Gabbana",
+    "Viva La Juicy": "Juicy-Couture",
+    "360": "Perry-Ellis", "360 Collection": "Perry-Ellis",
+    "Alien": "Mugler", "Angel": "Mugler",
+    "5th": "Elizabeth-Arden",
+    "Bharara": "Bharara",
+    "Blue Seduction": "Antonio-Banderas",
+    "Mr.": "Burberry",
+    "Territoire": "YZY-Perfume",
+    "AB Spirit Millionaire": "Lomani",
+    "Perry": "Perry-Ellis",
+    "Arsenal": "Gilles-Cantuel",
+    "Black": "Bvlgari",
+    "Eau": "Rochas",
+    "Jean": "Jean-Paul-Gaultier",
+    "Jo": "Jo-Malone-London",
+    "Le": "Jean-Paul-Gaultier",
+    "Live": "Lacoste",
+    "My": "Burberry",
+    "Royal": "Creed",
+    # Additional niche brands
+    "Orientica": "Orientica", "Emper": "Emper",
+    "Daniel Josier": "Daniel-Josier",
+    "Insurrection": "Reyane-Tradition",
+    "Zimaya": "Zimaya", "Bharara": "Bharara",
+    "Ainash": "Ainash",
+    "La": "Yves-Saint-Laurent",  # "La Nuit de l'Homme" etc.
+    "Night": "Yves-Saint-Laurent",  # "La Nuit" etc.
+    "Pure": "Paco-Rabanne",  # "Pure XS" etc.
+    "Very": "Versace",  # "Versace Pour Homme" etc.
+    "Love": "Chloe",  # "Love, Chloe" etc.
+    "Red": "Lacoste",  # "Lacoste Red" etc.
+    "United": "Benetton",  # "United Colors of Benetton"
+    "Game": "Davidoff",
+    "Genius": "Armaf",
+    "Amber": "Prada",
+    "Art": "Diptyque",
+    "Bella": "Vince-Camuto",
+    "Pink": "Lacoste",
+    "White": "Lacoste",
+    "R2B2": "Reyane-Tradition",
+    "So": "Loewe",
+    "Big": "Carolina-Herrera",
+    "New": "Calvin-Klein",
+    "Only": "Calvin-Klein",
+    "Real": "Nike",
+    "Acqua di Parisis": "Reyane-Tradition",
+    "Ilmin Il": "Ilmin",
+    "AHLI": "Bait-Al-Bakhoor",
+}
+
+
+def clean_name_for_matching(name: str) -> str:
+    """Normalize a product name for fuzzy matching."""
+    n = name.lower()
+    # Remove common noise words
+    for word in ['eau de', 'pour homme', 'pour femme', 'for men', 'for women',
+                 'for him', 'for her', 'parfum', 'spray', 'edp', 'edt', 'edc']:
+        n = n.replace(word, '')
+    n = re.sub(r'\d+\.?\d*\s*oz', '', n)
+    n = re.sub(r'\b(tester|refillable|gift set)\b', '', n, flags=re.IGNORECASE)
+    n = re.sub(r'[^a-z0-9\s]', '', n)
+    n = re.sub(r'\s+', ' ', n).strip()
+    return n
 
 
 def clean_search_query(raw_name: str) -> str:
-    """Extract a clean fragrance name for searching Fragrantica."""
+    """Extract a clean fragrance name for grouping."""
     q = raw_name
     q = re.sub(r'\d+\.?\d*\s*oz\.?', '', q)
-    for t in ['EDP', 'EDT', 'EDC', 'Parfum', 'Cologne', 'Body Mist', 'Body Spray',
-              'Eau De Parfum', 'Eau De Toilette']:
+    for t in ['EDP', 'EDT', 'EDC', 'Parfum', 'Cologne', 'Body Mist', 'Body Spray']:
         q = re.sub(r'\b' + re.escape(t) + r'\b', '', q, flags=re.IGNORECASE)
     q = re.sub(r'\bfor\s+(men|women|woman|unisex)\b', '', q, flags=re.IGNORECASE)
     q = re.sub(r'\bTESTER\b', '', q, flags=re.IGNORECASE)
@@ -83,19 +307,6 @@ def clean_search_query(raw_name: str) -> str:
     return q
 
 
-def group_products(products: List[dict]) -> Dict[str, List[dict]]:
-    """Group products by clean fragrance name for shared image lookup."""
-    groups = defaultdict(list)
-    for p in products:
-        if p.get('is_gift_set'):
-            continue
-        query = clean_search_query(p['raw_name'])
-        if len(query) < 3:
-            continue
-        groups[query].append(p)
-    return dict(groups)
-
-
 def make_image_filename(query: str) -> str:
     """Generate a stable filename from search query."""
     slug = re.sub(r'[^a-z0-9]+', '-', query.lower()).strip('-')
@@ -103,110 +314,70 @@ def make_image_filename(query: str) -> str:
     return f"{slug[:80]}-{h}.webp"
 
 
-async def is_rate_limited(page: Page) -> bool:
-    """Check if current page shows a rate limit / anti-bot response."""
+def get_our_brands(products: list) -> Dict[str, str]:
+    """Get unique brand names from our products and map to Fragrantica URLs.
+    Only returns brands with explicit mappings."""
+    brands = set(p['brand'] for p in products)
+    return {b: BRAND_URL_MAP[b] for b in brands if b in BRAND_URL_MAP}
+
+
+async def scrape_brand_page(page: Page, brand_slug: str) -> List[dict]:
+    """Scrape a Fragrantica brand/designer page for all product entries."""
+    url = f"https://www.fragrantica.com/designers/{brand_slug}.html"
+
     try:
+        resp = await page.goto(url, wait_until='domcontentloaded', timeout=15000)
+        await page.wait_for_timeout(1500)
+
+        # Check for errors
         content = await page.content()
-        lower = content.lower()
-        return any(s in lower for s in ['too many requests', 'giphy.com', 'access denied',
-                                         'captcha', 'rate limit'])
-    except Exception:
-        return False
-
-
-async def wait_for_rate_limit_clear(page: Page, context_factory):
-    """Wait until Fragrantica is accessible again, checking every 5 minutes."""
-    print("\n>>> Rate limited. Waiting for it to clear (checking every 5 min)...")
-    attempt = 0
-    while True:
-        attempt += 1
-        await asyncio.sleep(RATE_LIMIT_PAUSE)
-        print(f"    Checking if rate limit cleared (attempt {attempt})...")
-        try:
-            # Test with a simple search
-            await page.goto('https://www.fragrantica.com/search/?query=chanel',
-                          wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
-            await page.wait_for_timeout(2000)
-            if not await is_rate_limited(page):
-                print("    >>> Rate limit cleared! Resuming...\n")
-                return
-            else:
-                print(f"    Still rate limited. Waiting another 5 min...")
-        except Exception:
-            print(f"    Connection error. Waiting another 5 min...")
-
-
-async def search_and_get_image(page: Page, query: str) -> Optional[dict]:
-    """
-    Search Fragrantica and extract the product page URL and image.
-    Returns dict with 'image_url' and 'fragrantica_url', or None, or "RATE_LIMITED".
-    """
-    encoded = query.replace(' ', '+')
-    search_url = f"https://www.fragrantica.com/search/?query={encoded}"
-
-    try:
-        await page.goto(search_url, wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
-        await page.wait_for_timeout(2000)
-
-        if await is_rate_limited(page):
+        if 'too many requests' in content.lower() or 'giphy.com' in content.lower():
             return "RATE_LIMITED"
 
-        # Find product links
-        results = await page.query_selector_all('a[href*="/perfume/"]')
+        if resp and resp.status == 404:
+            return []
 
-        best_url = None
-        for result in results[:5]:
-            href = await result.get_attribute('href')
-            if href and '/perfume/' in href and href.endswith('.html'):
-                if href.startswith('/'):
-                    href = 'https://www.fragrantica.com' + href
-                best_url = href
-                break
+        # Extract all perfume entries
+        entries = []
+        links = await page.query_selector_all('a[href*="/perfume/"]')
 
-        if not best_url:
-            return None
+        for link in links:
+            href = await link.get_attribute('href') or ''
+            if '/perfume/' not in href or not href.endswith('.html'):
+                continue
 
-        # Extract Fragrantica product ID from URL to construct image URL directly
-        # URL format: /perfume/Brand/Product-Name-12345.html → ID is 12345
-        id_match = re.search(r'-(\d+)\.html$', best_url)
-        if id_match:
+            # Extract product ID from URL
+            id_match = re.search(r'-(\d+)\.html$', href)
+            if not id_match:
+                continue
+
             frag_id = id_match.group(1)
-            image_url = f"https://fimgs.net/mdimg/perfume-thumbs/375x500.{frag_id}.jpg"
-            return {"image_url": image_url, "fragrantica_url": best_url}
+            text = (await link.inner_text()).strip()
 
-        # Fallback: visit the product page to get the image
-        await asyncio.sleep(1.5)
-        try:
-            await page.goto(best_url, wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
-            await page.wait_for_timeout(1500)
+            # Extract product name (first line of text)
+            name = text.split('\n')[0].strip()
 
-            if await is_rate_limited(page):
-                return "RATE_LIMITED"
+            # Check for image
+            img = await link.query_selector('img')
+            has_img = img is not None
 
-            img = await page.query_selector('img[itemprop="image"]')
-            if img:
-                src = await img.get_attribute('src')
-                if src and 'perfume-thumbs' in src:
-                    src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
-                    return {"image_url": src, "fragrantica_url": best_url}
+            if name and frag_id:
+                entries.append({
+                    "name": name,
+                    "id": frag_id,
+                    "url": href if href.startswith('http') else f"https://www.fragrantica.com{href}",
+                    "has_img": has_img,
+                })
 
-            imgs = await page.query_selector_all('img[src*="perfume-thumbs"]')
-            for img in imgs:
-                src = await img.get_attribute('src')
-                if src:
-                    src = re.sub(r'/\d+x\d+\.', '/375x500.', src)
-                    return {"image_url": src, "fragrantica_url": best_url}
-        except Exception:
-            pass
+        return entries
 
-    except Exception:
-        pass
-
-    return None
+    except Exception as e:
+        print(f"    [!] Error: {e}")
+        return []
 
 
 async def download_image(url: str) -> Optional[bytes]:
-    """Download an image from the CDN."""
+    """Download an image from the CDN (not rate-limited)."""
     headers = {
         'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
         'Referer': 'https://www.fragrantica.com/',
@@ -258,8 +429,193 @@ def save_checkpoint(checkpoint: dict):
         json.dump(checkpoint, f, indent=2)
 
 
+def match_products_to_catalog(products: list, catalog: dict) -> Dict[str, dict]:
+    """
+    Match our products to Fragrantica catalog entries using fuzzy matching.
+    Returns: {clean_query -> {image_file, fragrantica_url}}
+    """
+    matches = {}
+    unmatched = 0
+
+    # Build lookup: brand → list of (clean_name, entry)
+    brand_lookup = {}
+    for brand_slug, entries in catalog.items():
+        for entry in entries:
+            clean = clean_name_for_matching(entry['name'])
+            if brand_slug not in brand_lookup:
+                brand_lookup[brand_slug] = []
+            brand_lookup[brand_slug].append((clean, entry))
+
+    # Group our products
+    groups = defaultdict(list)
+    for p in products:
+        if p.get('is_gift_set'):
+            continue
+        query = clean_search_query(p['raw_name'])
+        if len(query) >= 3:
+            groups[query].append(p)
+
+    brand_map = get_our_brands(products)
+
+    for query, prods in groups.items():
+        brand = prods[0]['brand']
+        slug = brand_map.get(brand, '')
+
+        # Get the Fragrantica entries for this brand
+        entries = brand_lookup.get(slug, [])
+        if not entries:
+            # Try without brand prefix in query
+            unmatched += 1
+            continue
+
+        # Clean our product name for matching
+        our_clean = clean_name_for_matching(query)
+
+        # Find best match
+        best_score = 0
+        best_entry = None
+
+        for their_clean, entry in entries:
+            # SequenceMatcher ratio
+            score = SequenceMatcher(None, our_clean, their_clean).ratio()
+
+            # Boost if key words match
+            our_words = set(our_clean.split())
+            their_words = set(their_clean.split())
+            overlap = len(our_words & their_words)
+            if our_words and their_words:
+                word_score = overlap / max(len(our_words), len(their_words))
+                score = score * 0.6 + word_score * 0.4
+
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        if best_entry and best_score >= FUZZY_THRESHOLD:
+            filename = make_image_filename(query)
+            matches[query] = {
+                "frag_id": best_entry['id'],
+                "frag_name": best_entry['name'],
+                "frag_url": best_entry['url'],
+                "image_url": f"https://fimgs.net/mdimg/perfume-thumbs/375x500.{best_entry['id']}.jpg",
+                "image_file": f"/images/products/{filename}",
+                "score": round(best_score, 3),
+            }
+        else:
+            unmatched += 1
+
+    print(f"Matched: {len(matches)} | Unmatched: {unmatched}")
+    return matches
+
+
+async def phase1_scrape_brands(page: Page, products: list, max_brands: Optional[int] = None) -> dict:
+    """Phase 1: Scrape Fragrantica brand pages to build local catalog."""
+
+    # Load existing catalog if any
+    catalog = {}
+    if CATALOG_FILE.exists():
+        with open(CATALOG_FILE) as f:
+            catalog = json.load(f)
+        print(f"Loaded existing catalog: {len(catalog)} brands, "
+              f"{sum(len(v) for v in catalog.values())} products")
+
+    brand_map = get_our_brands(products)
+    # Deduplicate slugs (many brands map to the same Fragrantica designer)
+    slugs_needed = set(brand_map.values())
+    slugs_todo = [s for s in slugs_needed if s not in catalog]
+
+    if max_brands:
+        slugs_todo = slugs_todo[:max_brands]
+
+    print(f"Brand slugs: {len(slugs_needed)} total, {len(slugs_todo)} to scrape")
+
+    if not slugs_todo:
+        print("All brands already scraped!")
+        return catalog
+
+    for i, slug in enumerate(slugs_todo):
+        print(f"[{i+1}/{len(slugs_todo)}] Scraping: {slug}")
+
+        entries = await scrape_brand_page(page, slug)
+
+        if entries == "RATE_LIMITED":
+            print("    [!] Rate limited! Waiting 5 minutes...")
+            await asyncio.sleep(300)
+            entries = await scrape_brand_page(page, slug)
+            if entries == "RATE_LIMITED":
+                print("    [!] Still limited. Saving and stopping.")
+                break
+
+        if isinstance(entries, list):
+            catalog[slug] = entries
+            print(f"    Found {len(entries)} products")
+        else:
+            catalog[slug] = []
+
+        # Save every 10 brands
+        if (i + 1) % 10 == 0:
+            with open(CATALOG_FILE, 'w') as f:
+                json.dump(catalog, f, indent=2)
+
+        await asyncio.sleep(BRAND_PAGE_DELAY + random.uniform(0, 2))
+
+    # Final save
+    with open(CATALOG_FILE, 'w') as f:
+        json.dump(catalog, f, indent=2)
+
+    total_entries = sum(len(v) for v in catalog.values())
+    print(f"\nCatalog complete: {len(catalog)} brands, {total_entries} products")
+    return catalog
+
+
+async def phase3_download_images(matches: dict, checkpoint: dict):
+    """Phase 3: Download images from CDN (not rate-limited, can go fast)."""
+    completed = checkpoint["completed"]
+    stats = checkpoint["stats"]
+
+    todo = {q: info for q, info in matches.items() if q not in completed}
+    print(f"\nDownloading {len(todo)} images from CDN...")
+
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    downloaded = 0
+    failed = 0
+
+    for i, (query, info) in enumerate(todo.items()):
+        if (i + 1) % 50 == 0:
+            print(f"  [{i+1}/{len(todo)}] {downloaded} downloaded...")
+
+        image_data = await download_image(info["image_url"])
+
+        if not image_data:
+            failed += 1
+            continue
+
+        filename = make_image_filename(query)
+        output_path = IMAGES_DIR / filename
+
+        if process_image(image_data, output_path):
+            completed[query] = {
+                "image_file": info["image_file"],
+                "fragrantica_url": info["frag_url"],
+            }
+            downloaded += 1
+            stats["downloaded"] = stats.get("downloaded", 0) + 1
+        else:
+            failed += 1
+
+        # Save checkpoint every 100
+        if (i + 1) % 100 == 0:
+            save_checkpoint(checkpoint)
+
+        # Small delay to be polite to CDN
+        await asyncio.sleep(0.1)
+
+    save_checkpoint(checkpoint)
+    print(f"Downloaded: {downloaded} | Failed: {failed}")
+
+
 def update_products_json(products: list, completed: dict):
-    """Update products.json with image paths from completed downloads."""
+    """Update products.json with image paths."""
     for p in products:
         query = clean_search_query(p['raw_name'])
         if query in completed:
@@ -270,162 +626,68 @@ def update_products_json(products: list, completed: dict):
         json.dump(products, f, indent=2)
 
     total = sum(1 for p in products if p.get('has_image'))
-    print(f"    products.json updated: {total}/{len(products)} have images ({total/len(products)*100:.1f}%)")
+    print(f"products.json: {total}/{len(products)} have images ({total/len(products)*100:.1f}%)")
 
 
-async def run_pipeline(max_items: Optional[int] = None, dry_run: bool = False):
+async def run_pipeline(max_brands: Optional[int] = None, dry_run: bool = False):
     with open(PRODUCTS_FILE) as f:
         products = json.load(f)
-
     print(f"Loaded {len(products)} products")
 
-    groups = group_products(products)
-    print(f"{len(groups)} unique fragrances (excluding gift sets)")
-
     checkpoint = load_checkpoint()
-    completed = checkpoint["completed"]
-    stats = checkpoint["stats"]
-    failed_set = set(checkpoint.get("failed", []))
-
-    todo = {q: prods for q, prods in groups.items()
-            if q not in completed and q not in failed_set}
-
-    print(f"Completed: {len(completed)} | Failed: {len(failed_set)} | Remaining: {len(todo)}")
-
-    todo_items = list(todo.items())
-    if max_items:
-        todo_items = todo_items[:max_items]
 
     if dry_run:
-        print(f"\n[DRY RUN] Would search for {len(todo_items)} fragrances")
-        for q, prods in todo_items[:20]:
-            print(f"  \"{q}\" ({len(prods)} products)")
+        brand_map = get_our_brands(products)
+        slugs = set(brand_map.values())
+        print(f"Would scrape {len(slugs)} brand pages on Fragrantica")
         return
 
-    if not todo_items:
-        print("Nothing new to process.")
-        update_products_json(products, completed)
-        return
-
-    est_hours = len(todo_items) * (BASE_DELAY + JITTER/2) / 3600
-    print(f"\nProcessing {len(todo_items)} fragrances (~{est_hours:.1f} hours at {BASE_DELAY}s delay)")
-    print(f"Start time: {time.strftime('%H:%M:%S')}\n")
-
-    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    # Phase 1: Scrape brand pages
+    print(f"\n{'='*60}")
+    print("PHASE 1: Scraping Fragrantica brand pages")
+    print(f"{'='*60}\n")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-            viewport={'width': 1280, 'height': 800},
-        )
+        context = await browser.new_context(viewport={'width': 1280, 'height': 800})
         page = await context.new_page()
+        await stealth_async(page)
 
-        # First: wait until rate limit clears
-        print("Checking if Fragrantica is accessible...")
-        await page.goto('https://www.fragrantica.com/search/?query=chanel',
-                       wait_until='domcontentloaded', timeout=SEARCH_TIMEOUT)
-        await page.wait_for_timeout(2000)
-        if await is_rate_limited(page):
-            await wait_for_rate_limit_clear(page, None)
-
-        found = 0
-        missed = 0
-        start_time = time.time()
-
-        for i, (query, prods) in enumerate(todo_items):
-            elapsed = time.time() - start_time
-            rate_per_sec = max((i + 1) / max(elapsed, 1), 0.001)
-            remaining_min = (len(todo_items) - i) / rate_per_sec / 60
-
-            print(f"[{i+1}/{len(todo_items)}] \"{query}\" ({len(prods)} prods) "
-                  f"[{found} ok, {missed} miss, ~{remaining_min:.0f}m]")
-
-            result = await search_and_get_image(page, query)
-
-            # Handle rate limiting with wait-and-retry
-            if result == "RATE_LIMITED":
-                await wait_for_rate_limit_clear(page, None)
-                # Retry this query
-                result = await search_and_get_image(page, query)
-                if result == "RATE_LIMITED":
-                    print("    Still limited after wait. Skipping for now.")
-                    await asyncio.sleep(BASE_DELAY)
-                    continue
-
-            stats["searched"] = stats.get("searched", 0) + 1
-
-            if result is None:
-                missed += 1
-                checkpoint.setdefault("failed", []).append(query)
-                await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
-                continue
-
-            # Download image from CDN (not rate-limited)
-            image_data = await download_image(result["image_url"])
-
-            if not image_data:
-                missed += 1
-                checkpoint.setdefault("failed", []).append(query)
-                await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
-                continue
-
-            filename = make_image_filename(query)
-            output_path = IMAGES_DIR / filename
-
-            if process_image(image_data, output_path):
-                kb = output_path.stat().st_size / 1024
-                print(f"    [+] {filename} ({kb:.1f}KB)")
-                completed[query] = {
-                    "image_file": f"/images/products/{filename}",
-                    "fragrantica_url": result["fragrantica_url"],
-                }
-                found += 1
-                stats["downloaded"] = stats.get("downloaded", 0) + 1
-            else:
-                missed += 1
-                checkpoint.setdefault("failed", []).append(query)
-
-            # Save checkpoint every 10, update products.json every 100
-            if (i + 1) % 10 == 0:
-                save_checkpoint(checkpoint)
-            if (i + 1) % 100 == 0:
-                update_products_json(products, completed)
-
-            await asyncio.sleep(BASE_DELAY + random.uniform(0, JITTER))
-
+        catalog = await phase1_scrape_brands(page, products, max_brands)
         await browser.close()
 
-    save_checkpoint(checkpoint)
-
-    total_elapsed = (time.time() - start_time) / 60
+    # Phase 2: Match products to catalog
     print(f"\n{'='*60}")
-    print(f"Pipeline complete! ({total_elapsed:.0f} minutes)")
-    print(f"  Downloaded: {found}")
-    print(f"  Missed: {missed}")
-    print(f"  Total coverage: {len(completed)}/{len(groups)} ({len(completed)/max(len(groups),1)*100:.1f}%)")
+    print("PHASE 2: Matching products to Fragrantica catalog")
+    print(f"{'='*60}\n")
+
+    matches = match_products_to_catalog(products, catalog)
+
+    # Phase 3: Download images from CDN
+    print(f"\n{'='*60}")
+    print("PHASE 3: Downloading images from CDN")
     print(f"{'='*60}")
 
-    update_products_json(products, completed)
+    await phase3_download_images(matches, checkpoint)
+
+    # Update products.json
+    print(f"\n{'='*60}")
+    print("DONE")
+    print(f"{'='*60}\n")
+    update_products_json(products, checkpoint["completed"])
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fetch fragrance images from Fragrantica")
-    parser.add_argument("--max", type=int, default=None, help="Max fragrances to process")
-    parser.add_argument("--reset", action="store_true", help="Clear checkpoint and start fresh")
-    parser.add_argument("--reset-failed", action="store_true", help="Clear failed list only (retry)")
-    parser.add_argument("--dry-run", action="store_true", help="Show queries without downloading")
+    parser.add_argument("--max-brands", type=int, default=None, help="Max brands to scrape")
+    parser.add_argument("--reset", action="store_true", help="Clear all checkpoints")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would happen")
     args = parser.parse_args()
 
-    if args.reset and CHECKPOINT_FILE.exists():
-        os.remove(CHECKPOINT_FILE)
-        print("Checkpoint cleared.")
-    elif args.reset_failed and CHECKPOINT_FILE.exists():
-        with open(CHECKPOINT_FILE) as f:
-            cp = json.load(f)
-        cp["failed"] = []
-        with open(CHECKPOINT_FILE, 'w') as f:
-            json.dump(cp, f, indent=2)
-        print("Failed list cleared.")
+    if args.reset:
+        for f in [CHECKPOINT_FILE, CATALOG_FILE]:
+            if f.exists():
+                os.remove(f)
+        print("Checkpoints cleared.")
 
-    asyncio.run(run_pipeline(max_items=args.max, dry_run=args.dry_run))
+    asyncio.run(run_pipeline(max_brands=args.max_brands, dry_run=args.dry_run))
